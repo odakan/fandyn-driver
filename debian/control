@@ -1,0 +1,11 @@
+Package: fandyn
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: deniz <onurdenizakan@gmail.com>
+Section: utils
+Priority: optional
+Depends: libc6, systemd
+Description: adaptive low-noise fan control for Jetson Nano
+ fandynd predicts temperature from its trend and CPU/GPU/RAM load, and
+ drives the pwm-fan for the lowest noise that still keeps the board cool.
+ Includes quiet, balanced and performance profiles and zero-RPM mode.

@@ -1,0 +1,2 @@
+# Let user deniz control the fan without root (sysfs permissions reset every boot)
+ACTION=="add|change", SUBSYSTEM=="platform", KERNEL=="pwm-fan", RUN+="/bin/sh -c 'cd /sys/devices/pwm-fan && chown deniz target_pwm temp_control tach_enable step_time'"

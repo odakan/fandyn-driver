@@ -1,0 +1,17 @@
+[Unit]
+Description=fandyn adaptive fan control
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/fandynd
+ExecReload=/bin/kill -HUP $MAINPID
+# hand the fan back to the kernel even if the daemon crashes
+ExecStopPost=/bin/sh -c 'echo 1 > /sys/devices/pwm-fan/temp_control'
+RuntimeDirectory=fandyn
+Restart=on-failure
+RestartSec=2
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target
