@@ -1,0 +1,26 @@
+[Unit]
+Description=fandyn fan control
+Documentation=file:///usr/share/doc/fandyn/README.md
+After=local-fs.target
+# never give up restarting: the fan must always be controlled
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+ExecStart=/usr/sbin/fandynd
+ExecReload=/bin/kill -HUP $MAINPID
+# whatever happens to the daemon, the kernel takes the fan back
+ExecStopPost=-/bin/sh -c 'echo 1 > /sys/devices/pwm-fan/temp_control'
+RuntimeDirectory=fandyn
+WatchdogSec=15
+Restart=always
+RestartSec=1
+Nice=-10
+OOMScoreAdjust=-900
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,53 @@
+.\" SPDX-License-Identifier: Apache-2.0
+.TH FANDYND 8 "2026-10-22" "fandyn 1.0.0" "System Administration"
+.SH NAME
+fandynd \- calibrated low-noise fan control daemon for Jetson Nano
+.SH SYNOPSIS
+.B fandynd
+.br
+.B fandynd \-\-check
+.br
+.B fandynd status
+.br
+.B fandynd \-\-version
+.SH DESCRIPTION
+.B fandynd
+drives the pwm-fan of a Jetson Nano from the fixed profile written by
+.BR fandyn-calibrate (8).
+Once per second it reads the hottest CPU/GPU thermal zone and writes
+.IR /sys/devices/pwm-fan/target_pwm .
+It speeds up immediately, slows down only after the board has cooled by the
+calibrated hysteresis, stops the fan when cool (zero-RPM) and starts it with
+a verified kick.
+.PP
+It runs the fan at full speed when the temperature is critical, when no sensor
+can be read for 3 seconds, and when the fan does not spin after 3 kicks.
+It takes fan control back if the kernel re-enables its own, keeps running if
+the fan device disappears, and falls back to a built-in safe profile when the
+profile is missing or corrupt. On SIGTERM it hands the fan back to the kernel.
+SIGHUP reloads the profile; an invalid profile is rejected and the current one kept.
+.PP
+It uses no heap memory and no floating point, and is normally started by systemd
+.RI ( fandyn.service ,
+with a watchdog).
+.SH OPTIONS
+.TP
+.B \-\-check
+Show the profile, sensors, fan and curve, then exit.
+.TP
+.B status
+Show the live state (temperature, PWM, RPM, mode).
+.TP
+.BR \-\-profile " FILE, " \-\-root " DIR, " \-\-run\-dir " DIR, " \-\-tick\-ms " N"
+Testing only: alternative profile, sysfs root, runtime directory and tick.
+.SH FILES
+.TP
+.I /var/lib/fandyn/profile
+Fixed profile (CRC-protected) written by fandyn-calibrate.
+.TP
+.I /run/fandyn/status
+Live state.
+.SH SEE ALSO
+.BR fandyn-calibrate (8),
+.BR systemctl (1),
+.BR journalctl (1)

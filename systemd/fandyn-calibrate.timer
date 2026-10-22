@@ -1,0 +1,9 @@
+[Unit]
+Description=Calibrate fandyn after boot if it was never calibrated
+
+[Timer]
+# does not delay boot; the service itself exits at once when a profile exists
+OnBootSec=3min
+
+[Install]
+WantedBy=timers.target

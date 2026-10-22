@@ -1,7 +1,33 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 set -e
-if [ "$1" = configure ]; then
-    systemctl daemon-reload
-    systemctl enable fandyn.service
-    systemctl restart fandyn.service
+UNITS="fandyn.service fandyn-calibrate.timer"
+
+if [ "$1" = configure ] || [ "$1" = abort-upgrade ] || [ "$1" = abort-deconfigure ] || [ "$1" = abort-remove ]; then
+    # enable (debhelper-style: keep an admin's explicit disable across upgrades)
+    deb-systemd-helper unmask $UNITS >/dev/null || true
+    for u in $UNITS; do
+        if deb-systemd-helper --quiet was-enabled "$u"; then
+            deb-systemd-helper enable "$u" >/dev/null || true
+        else
+            deb-systemd-helper update-state "$u" >/dev/null || true
+        fi
+    done
+
+    if [ -d /run/systemd/system ]; then
+        systemctl --system daemon-reload >/dev/null || true
+    fi
+
+    # calibrate once, on first install, if this machine has the fan
+    if [ ! -e /var/lib/fandyn/profile ] && [ -e /sys/devices/pwm-fan/target_pwm ] && [ -z "${FANDYN_NO_CALIBRATE:-}" ]; then
+        deb-systemd-invoke stop fandyn.service >/dev/null 2>&1 || true
+        echo "fandyn: calibrating this board (about 16 minutes; the fan will be loud)"
+        fandyn-calibrate || echo "fandyn: calibration incomplete; a safe profile is in use. Re-run: sudo fandyn-calibrate --force"
+    fi
+
+    if [ -d /run/systemd/system ]; then
+        deb-systemd-invoke restart fandyn.service >/dev/null || true
+        deb-systemd-invoke start fandyn-calibrate.timer >/dev/null || true
+    fi
 fi
+exit 0

@@ -1,0 +1,18 @@
+[Unit]
+Description=fandyn one-time fan and thermal calibration
+Documentation=file:///usr/share/doc/fandyn/README.md
+# runs when the fan exists AND (no profile yet OR the user requested it:
+# sudo fandyn-calibrate --background / --next-boot create the request flag)
+ConditionPathExists=/sys/devices/pwm-fan/target_pwm
+ConditionPathExists=|!/var/lib/fandyn/profile
+ConditionPathExists=|/var/lib/fandyn/recalibrate
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/fandyn-calibrate
+TimeoutStartSec=45min
+# 2 = profile written with warnings or as safe fallback
+SuccessExitStatus=2
+# if this unit was stopped or killed mid-run: kernel takes the fan, runtime restarts
+ExecStopPost=-/bin/sh -c '[ "$$SERVICE_RESULT" = success ] || echo 1 > /sys/devices/pwm-fan/temp_control'
+ExecStopPost=-/bin/systemctl --no-block start fandyn.service

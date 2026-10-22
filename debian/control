@@ -2,10 +2,15 @@ Package: fandyn
 Version: @VERSION@
 Architecture: @ARCH@
 Maintainer: deniz <onurdenizakan@gmail.com>
+Installed-Size: @SIZE@
 Section: utils
 Priority: optional
-Depends: libc6, systemd
-Description: adaptive low-noise fan control for Jetson Nano
- fandynd predicts temperature from its trend and CPU/GPU/RAM load, and
- drives the pwm-fan for the lowest noise that still keeps the board cool.
- Includes quiet, balanced and performance profiles and zero-RPM mode.
+Depends: libc6 (>= 2.27), init-system-helpers (>= 1.18~)
+Homepage: https://github.com/odakan/fandyn-driver
+Description: calibrated low-noise fan control for Jetson Nano
+ fandyn learns the board once, at install: it measures the fan, fits a
+ physical thermal model, then designs and tests a fixed fan profile.
+ .
+ The runtime daemon is a tiny integer-only loop that follows that profile:
+ silent when cool, full speed under heavy load, and full speed whenever it
+ cannot read a sensor. It hands the fan back to the kernel when stopped.

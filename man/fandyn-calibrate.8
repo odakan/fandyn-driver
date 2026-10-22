@@ -1,0 +1,78 @@
+.\" SPDX-License-Identifier: Apache-2.0
+.TH FANDYN-CALIBRATE 8 "2026-10-22" "fandyn 1.0.0" "System Administration"
+.SH NAME
+fandyn-calibrate \- one-time fan and thermal calibration for fandyn
+.SH SYNOPSIS
+.B fandyn-calibrate
+.RB [ \-\-force ]
+.RB [ \-\-max\-temp
+.IR C ]
+.RB [ \-\-quick ]
+.RB [ \-o
+.IR DIR ]
+.br
+.B fandyn-calibrate
+.BR \-\-background " | " \-\-next\-boot
+.br
+.B fandyn-calibrate \-\-refit
+.I FILE
+.SH DESCRIPTION
+Learns the board once and writes the fixed profile used by
+.BR fandynd (8).
+It is loud on purpose: for about 16 minutes it sweeps the fan through its whole
+range and loads every CPU core. It measures the fan's speed curve, floor and
+start-up kick; fits a lumped thermal model (heatsink capacity, fan-dependent
+convection, die-to-sink resistance, ambient) by output-error least squares with
+covariance estimates; designs the slowest fan curve that still holds each
+temperature; then tests that profile on the board and in simulation. If the model
+fails its statistical or physical checks, a safe fallback curve is used.
+.PP
+It runs automatically when the package is installed. A guardian process
+returns the fan to the kernel if the calibrator itself dies.
+.SH OPTIONS
+.TP
+.B \-\-force
+Recalibrate now, replacing an existing profile. Without it the calibrator
+refuses to overwrite a profile.
+.TP
+.B \-\-background
+Recalibrate now as a systemd service; follow with
+.BR "journalctl \-fu fandyn-calibrate" .
+.TP
+.B \-\-next\-boot
+Recalibrate unattended about 3 minutes after the next boot.
+.TP
+.BI \-\-max\-temp " C"
+Temperature where the fan reaches full speed (55\(en80, default 70).
+.TP
+.B \-\-quick
+Shorter measurement (about 7 minutes, less accurate).
+.TP
+.BI \-o " DIR"
+Output directory (default
+.IR /var/lib/fandyn ).
+.TP
+.BI \-\-refit " FILE"
+Refit the thermal model from a saved calibration.csv without touching the fan.
+.SH EXIT STATUS
+0 calibrated and tested; 1 no fan, no access or write error; 2 profile written
+with warnings or as safe fallback; 3 aborted; 4 refused (profile exists, no
+.BR \-\-force ).
+.SH FILES
+.TP
+.I /var/lib/fandyn/profile
+The fixed profile.
+.TP
+.I /var/lib/fandyn/calibration.csv
+Every raw sample.
+.TP
+.I /var/lib/fandyn/report.txt
+Model, statistics and test results.
+.TP
+.I /var/lib/fandyn/history.csv
+One line per calibration.
+.TP
+.I /var/lib/fandyn/recalibrate
+Pending recalibration request.
+.SH SEE ALSO
+.BR fandynd (8)

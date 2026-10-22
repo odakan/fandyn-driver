@@ -1,440 +1,382 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 deniz <onurdenizakan@gmail.com> */
 /*
- * fandynd - adaptive, low-noise fan daemon for the Jetson Nano.
+ * fandynd - fan control runtime for the Jetson Nano.
  *
- * Once per interval it:
- *   1. reads CPU/GPU temperatures and CPU/GPU/RAM load
- *   2. predicts where the temperature is heading (trend + load)
- *   3. maps that prediction to a fan speed, plus a slow "trim" that adds
- *      speed if the board stays above its temperature limit
- *   4. shapes the output for low noise: fast ramp-up, slow ramp-down,
- *      a deadband, a spin-up kick, and fan-off when cool (zero-RPM)
+ * Loads the fixed profile made by fandyn-calibrate, then once per second:
+ * read temperature -> fd_step() -> write target_pwm. Nothing else.
  *
- * It writes /sys/devices/pwm-fan/target_pwm and hands control back to the
- * kernel (temp_control=1) when it exits.
+ * Design rules: no heap, no floating point, no threads, bounded loops,
+ * every error handled locally. It never exits on hardware errors: it keeps
+ * retrying quietly, and runs the fan flat out when it cannot see a sensor.
+ * On SIGTERM/SIGINT it hands the fan back to the kernel.
  */
 #define _GNU_SOURCE
-#include <dirent.h>
-#include <errno.h>
-#include <math.h>
+#include "fandyn.h"
+
 #include <signal.h>
 #include <stdarg.h>
 #include <stddef.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <time.h>
-#include <unistd.h>
 
-#ifndef VERSION
-#define VERSION "dev"
-#endif
+#define DEFAULT_PROFILE "/var/lib/fandyn/profile"
+#define DEFAULT_RUNDIR  "/run/fandyn"
+#define FAN_DIR         "/sys/devices/pwm-fan"
+#define REFRESH_TICKS   30     /* rewrite target_pwm even when unchanged */
+#define ASSERT_TICKS    10     /* re-check temp_control / tach_enable */
+#define RESCAN_TICKS    10     /* re-discover sensors while they are failing */
+#define LOG_QUIET_MS    600000 /* repeat one kind of warning at most every 10 min */
 
-#define FAN       "/sys/devices/pwm-fan/"
-#define GPU_LOAD  "/sys/devices/gpu.0/load"
-#define MAX_ZONES 8
-#define PATHLEN   300
+static volatile sig_atomic_t g_stop, g_reload;
+static void on_signal(int sig) { if (sig == SIGHUP) g_reload = 1; else g_stop = 1; }
 
-/* ---------------------------------------------------------------- config */
+static struct {
+    char target[FD_PATH], control[FD_PATH], tach_en[FD_PATH], rpm[FD_PATH];
+    char status[FD_PATH], status_tmp[FD_PATH];
+} path;
 
-struct cfg {
-    char   profile[32];
-    char   zones[128];      /* comma-separated thermal zone types        */
-    int    interval_ms;     /* control loop period                       */
-    double t_start;         /* predicted temp where fan leaves min speed */
-    double t_full;          /* predicted temp for full speed             */
-    double curve;           /* >1 = quieter low end, steeper top         */
-    double t_crit;          /* real temp that forces full speed at once  */
-    int    zero_rpm;        /* allow the fan to stop when cool           */
-    double t_on, t_off;     /* zero-RPM start/stop thresholds            */
-    double lookahead;       /* seconds of temperature trend to predict   */
-    double load_gain;       /* degrees added at 100% load                */
-    double ram_base;        /* RAM use fraction counted as "no load"     */
-    double ram_weight;      /* how much RAM pressure counts as load      */
-    double t_limit;         /* trim adds speed while above this          */
-    double ki;              /* trim speed (PWM per degree-second)        */
-    int    min_pwm, max_pwm;
-    int    kick_pwm, kick_ms;
-    double slew_up, slew_down; /* PWM units per second                   */
-    int    deadband;        /* ignore output changes smaller than this   */
-};
+static char g_pbuf[FD_PROFILE_MAX];
+static long g_tick;
+static int  g_tick_ms = 1000;
 
-static const struct cfg presets[] = {
-    { "quiet", "CPU-therm,GPU-therm", 1000,
-      50, 82, 1.8, 90,  1, 55, 47,  15, 4,  0.60, 0.3,  76, 0.5,
-      18, 255, 50, 1500,  25, 2, 4 },
-    { "balanced", "CPU-therm,GPU-therm", 1000,
-      45, 75, 1.5, 90,  1, 50, 44,  20, 8,  0.60, 0.5,  70, 1.0,
-      18, 255, 50, 1500,  40, 3, 3 },
-    { "performance", "CPU-therm,GPU-therm", 1000,
-      38, 65, 1.0, 88,  0, 0, 0,    30, 12, 0.60, 0.7,  62, 2.0,
-      30, 255, 60, 1000,  80, 5, 2 },
-};
+/* ---------------------------------------------------------------- logging */
 
-struct key { const char *name; char type; size_t off; };
-#define K(n, t) { #n, t, offsetof(struct cfg, n) }
-static const struct key keys[] = {
-    K(zones, 's'), K(interval_ms, 'i'), K(t_start, 'd'), K(t_full, 'd'),
-    K(curve, 'd'), K(t_crit, 'd'), K(zero_rpm, 'i'), K(t_on, 'd'),
-    K(t_off, 'd'), K(lookahead, 'd'), K(load_gain, 'd'), K(ram_base, 'd'),
-    K(ram_weight, 'd'), K(t_limit, 'd'), K(ki, 'd'), K(min_pwm, 'i'),
-    K(max_pwm, 'i'), K(kick_pwm, 'i'), K(kick_ms, 'i'), K(slew_up, 'd'),
-    K(slew_down, 'd'), K(deadband, 'i'),
-};
+enum { EV_PROFILE, EV_ZONES, EV_TEMP, EV_WRITE, EV_CONTROL, EV_MODE, EV_COUNT };
+static long g_last_log[EV_COUNT];
+static int  g_logged[EV_COUNT];
 
-static int verbose;
+static void vlog(int prio, const char *fmt, va_list ap)
+{
+    char buf[300];
+    int n = snprintf(buf, sizeof buf, "<%d>", prio);
+    int m = vsnprintf(buf + n, sizeof buf - (size_t)n - 1, fmt, ap);
+    if (m < 0) return;
+    size_t len = (size_t)n + (size_t)m;
+    if (len > sizeof buf - 2) len = sizeof buf - 2;
+    buf[len++] = '\n';
+    if (write(STDERR_FILENO, buf, len) < 0) { /* nowhere else to report */ }
+}
 
-static void logmsg(const char *fmt, ...)
+static void logmsg(int prio, const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    vlog(prio, fmt, ap);
     va_end(ap);
-    fputc('\n', stderr);
 }
 
-static char *trim(char *s)
+/* Rate-limited: each event kind logs at most once per LOG_QUIET_MS. */
+static void logev(int ev, int prio, const char *fmt, ...)
 {
-    while (*s == ' ' || *s == '\t') s++;
-    char *e = s + strlen(s);
-    while (e > s && strchr(" \t\r\n", e[-1])) *--e = 0;
-    return s;
+    long quiet = LOG_QUIET_MS / g_tick_ms;
+    if (g_logged[ev] && g_tick - g_last_log[ev] < quiet) return;
+    g_logged[ev] = 1;
+    g_last_log[ev] = g_tick;
+    va_list ap;
+    va_start(ap, fmt);
+    vlog(prio, fmt, ap);
+    va_end(ap);
 }
 
-static int set_key(struct cfg *c, const char *k, const char *v)
+/* --------------------------------------------------- systemd notification */
+
+static int g_nfd = -1;
+static struct sockaddr_un g_naddr;
+static socklen_t g_nlen;
+
+static void notify_init(void)
 {
-    for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
-        if (strcmp(keys[i].name, k)) continue;
-        char *p = (char *)c + keys[i].off;
-        if (keys[i].type == 'i') *(int *)p = atoi(v);
-        else if (keys[i].type == 'd') *(double *)p = atof(v);
-        else snprintf(p, sizeof c->zones, "%s", v);
-        return 0;
-    }
-    return -1;
+    const char *s = getenv("NOTIFY_SOCKET");
+    if (!s || (s[0] != '/' && s[0] != '@')) return;
+    size_t l = strlen(s);
+    if (l >= sizeof g_naddr.sun_path) return;
+    memset(&g_naddr, 0, sizeof g_naddr);
+    g_naddr.sun_family = AF_UNIX;
+    memcpy(g_naddr.sun_path, s, l);
+    if (s[0] == '@') g_naddr.sun_path[0] = '\0';     /* abstract socket */
+    g_nlen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + l);
+    g_nfd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 }
 
-/* Load preset named by "profile=", then apply the file's other keys on top. */
-static int load_cfg(const char *path, struct cfg *c)
+static void notify(const char *msg)
 {
-    char lines[64][160];
-    int n = 0;
-    FILE *f = fopen(path, "r");
-    if (f) {
-        while (n < 64 && fgets(lines[n], sizeof lines[n], f)) n++;
-        fclose(f);
-    } else if (errno != ENOENT) {
-        logmsg("cannot read %s: %s", path, strerror(errno));
+    if (g_nfd < 0) return;
+    (void)sendto(g_nfd, msg, strlen(msg), MSG_DONTWAIT | MSG_NOSIGNAL,
+                 (const struct sockaddr *)&g_naddr, g_nlen);
+}
+
+/* ------------------------------------------------------------------ setup */
+
+static int load_profile(const char *file, struct fd_profile *out, const char **why)
+{
+    int n = fd_read_file(file, g_pbuf, sizeof g_pbuf);
+    if (n < 0) { *why = errno == ENOENT ? "not found" : "unreadable"; return -1; }
+    if (n >= (int)sizeof g_pbuf - 1) { *why = "too large"; return -1; }
+    return fd_profile_parse(g_pbuf, (size_t)n, out, why);
+}
+
+/* Load the profile, or fall back to the built-in one. Logs the outcome. */
+static void use_profile(const char *file, struct fd_profile *p, int keep_current)
+{
+    struct fd_profile np;
+    const char *why = "";
+    if (load_profile(file, &np, &why) == 0) {
+        *p = np;
+        logmsg(6, "profile %s loaded (%s, %d points, floor %d)", file,
+               np.calibrated ? "calibrated" : "fallback", np.npoints, np.floor_pwm);
+    } else if (keep_current) {
+        logmsg(4, "profile %s rejected (%s); keeping the current one", file, why);
+    } else {
+        *p = fd_builtin;
+        logev(EV_PROFILE, 4, "profile %s rejected (%s); using built-in safe profile", file, why);
     }
+}
 
-    const char *prof = "balanced";
-    for (int i = 0; i < n; i++) {
-        char *l = trim(lines[i]), *eq = strchr(l, '=');
-        if (*l == '#' || !eq) continue;
-        *eq = 0;
-        if (!strcmp(trim(l), "profile")) prof = trim(eq + 1);
-        else *eq = '=';
-    }
+static int mkpath(char *dst, const char *a, const char *b)
+{
+    return snprintf(dst, FD_PATH, "%s%s", a, b) >= FD_PATH ? -1 : 0;
+}
 
-    *c = presets[1];
-    int found = 0;
-    for (size_t i = 0; i < sizeof presets / sizeof presets[0]; i++)
-        if (!strcmp(presets[i].profile, prof)) { *c = presets[i]; found = 1; }
-    if (!found) logmsg("unknown profile '%s', using balanced", prof);
+/* "45.5 C" from millidegrees, sign-safe. */
+static void fmt_temp(char *b, size_t cap, int t)
+{
+    if (t == FD_TEMP_INVALID) { snprintf(b, cap, "unknown"); return; }
+    unsigned a = t < 0 ? 0u - (unsigned)t : (unsigned)t;
+    snprintf(b, cap, "%s%u.%u C", t < 0 ? "-" : "", a / 1000u, a % 1000u / 100u);
+}
 
-    for (int i = 0; i < n; i++) {
-        char *l = trim(lines[i]), *eq = strchr(l, '=');
-        if (*l == '#' || !*l || !eq) continue;
-        *eq = 0;
-        if (set_key(c, trim(l), trim(eq + 1)))
-            logmsg("unknown config key '%s'", trim(l));
-    }
-
-    /* keep values sane so a bad config can't disable cooling */
-    if (c->interval_ms < 100) c->interval_ms = 100;
-    if (c->max_pwm > 255 || c->max_pwm < 1) c->max_pwm = 255;
-    if (c->min_pwm < 0 || c->min_pwm > c->max_pwm) c->min_pwm = 18;
-    if (c->t_full <= c->t_start) c->t_full = c->t_start + 1;
-    if (c->curve <= 0) c->curve = 1;
-    if (c->t_crit <= 0 || c->t_crit > 100) c->t_crit = 90;
-    if (c->slew_up <= 0) c->slew_up = 40;
-    if (c->slew_down <= 0) c->slew_down = 3;
+static int write_status(const struct fd_profile *p, const struct fd_state *s, int temp, int rpm, int out)
+{
+    char buf[400];
+    char t[24];
+    fmt_temp(t, sizeof t, temp);
+    int n = snprintf(buf, sizeof buf,
+        "state=%s\ntemp=%s\npwm=%d\nrpm=%d\nprofile=%s\nfloor_bias=%d\nuptime_s=%ld\n",
+        fd_mode_names[s->mode], t, out, rpm, p->calibrated ? "calibrated" : "fallback",
+        s->floor_bias, g_tick * g_tick_ms / 1000);
+    if (n <= 0 || (size_t)n >= sizeof buf) return -1;
+    int fd = open(path.status_tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return -1;
+    ssize_t w = write(fd, buf, (size_t)n);
+    int ok = (w == n);
+    if (close(fd) != 0) ok = 0;
+    if (!ok || rename(path.status_tmp, path.status) != 0) { (void)unlink(path.status_tmp); return -1; }
     return 0;
 }
 
-/* --------------------------------------------------------------- sysfs io */
+/* --------------------------------------------------------------- commands */
 
-static int read_long(const char *path, long *out)
+static int cmd_status(const char *rundir)
 {
-    FILE *f = fopen(path, "r");
-    if (!f) return -1;
-    int ok = fscanf(f, "%ld", out) == 1;
-    fclose(f);
-    return ok ? 0 : -1;
+    char file[FD_PATH], buf[512];
+    if (mkpath(file, rundir, "/status")) return 2;
+    int n = fd_read_file(file, buf, sizeof buf);
+    if (n <= 0) { fprintf(stderr, "fandynd is not running (no %s)\n", file); return 1; }
+    fputs(buf, stdout);
+    return 0;
 }
 
-static int write_long(const char *path, long v)
+static int cmd_check(const char *root, const char *profile)
 {
-    FILE *f = fopen(path, "w");
-    if (!f) return -1;
-    int ok = fprintf(f, "%ld", v) > 0;
-    return (fclose(f) == 0 && ok) ? 0 : -1;
-}
-
-/* Find thermal zones whose type is in the comma-separated list. */
-static int find_zones(const char *want, char paths[][PATHLEN])
-{
-    int n = 0;
-    DIR *d = opendir("/sys/class/thermal");
-    if (!d) return 0;
-    struct dirent *e;
-    while ((e = readdir(d)) && n < MAX_ZONES) {
-        if (strncmp(e->d_name, "thermal_zone", 12)) continue;
-        char p[PATHLEN], type[64] = "";
-        snprintf(p, sizeof p, "/sys/class/thermal/%s/type", e->d_name);
-        FILE *f = fopen(p, "r");
-        if (!f) continue;
-        if (fgets(type, sizeof type, f)) trim(type);
-        fclose(f);
-
-        char list[128];
-        snprintf(list, sizeof list, "%s", want);
-        for (char *t = strtok(list, ","); t; t = strtok(NULL, ","))
-            if (!strcmp(trim(t), type)) {
-                snprintf(paths[n++], PATHLEN, "/sys/class/thermal/%s/temp", e->d_name);
-                break;
-            }
+    struct fd_profile p;
+    const char *why = "";
+    int rc = 0;
+    if (load_profile(profile, &p, &why) == 0) {
+        printf("profile:  %s (%s)\n", profile, p.calibrated ? "calibrated" : "fallback");
+    } else {
+        printf("profile:  %s INVALID: %s -> built-in safe profile\n", profile, why);
+        p = fd_builtin;
+        rc = 2;
     }
-    closedir(d);
-    return n;
+    struct fd_zones z;
+    int nz = fd_find_zones(root, &z);
+    int t = fd_read_temp(&z);
+    char tb[24];
+    fmt_temp(tb, sizeof tb, t);
+    printf("sensors:  %d zone(s), hottest %s\n", nz, tb);
+    long v;
+    int fan = fd_read_long(path.control, &v) == 0;
+    printf("fan:      %s", fan ? "found" : "NOT FOUND\n");
+    if (fan) printf(" (temp_control=%ld)\n", v);
+    if (!fan && rc == 0) rc = 1;
+    printf("zero-rpm: %s", p.zero_rpm ? "" : "off\n");
+    if (p.zero_rpm) printf("fan stops below %d C (after cooling %d.%d C)\n", p.off_below_mC / 1000,
+                           p.hyst_mC / 1000, p.hyst_mC % 1000 / 100);
+    printf("floor %d, kick %d for %d ms, slew down %d/s, min on %d s, critical %d C, tach %s\n",
+           p.floor_pwm, p.kick_pwm, p.kick_ms, p.slew_down, p.min_on_s, p.crit_mC / 1000,
+           p.tach ? "on" : "off");
+    printf("curve:   ");
+    for (int c = 30; c <= 90; c += 5) printf(" %dC:%d", c, fd_curve(&p, c * 1000));
+    printf("\n");
+    return rc;
 }
-
-/* Hottest zone in degrees C, or NAN if none could be read. */
-static double read_temp(char paths[][PATHLEN], int n)
-{
-    double t = NAN;
-    for (int i = 0; i < n; i++) {
-        long v;
-        if (read_long(paths[i], &v) == 0 && (isnan(t) || v / 1000.0 > t))
-            t = v / 1000.0;
-    }
-    return t;
-}
-
-/* CPU busy fraction since the previous call. */
-static double read_cpu(void)
-{
-    static unsigned long long pbusy, ptotal;
-    unsigned long long v[8] = {0};
-    FILE *f = fopen("/proc/stat", "r");
-    if (!f) return 0;
-    int n = fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
-                   &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]);
-    fclose(f);
-    if (n < 4) return 0;
-    unsigned long long total = 0, idle = v[3] + v[4];
-    for (int i = 0; i < 8; i++) total += v[i];
-    unsigned long long busy = total - idle;
-    double r = 0;
-    if (total > ptotal) r = (double)(busy - pbusy) / (total - ptotal);
-    pbusy = busy; ptotal = total;
-    return r < 0 ? 0 : r > 1 ? 1 : r;
-}
-
-/* Used RAM fraction (MemTotal - MemAvailable). */
-static double read_ram(void)
-{
-    char line[128];
-    long total = 0, avail = -1;
-    FILE *f = fopen("/proc/meminfo", "r");
-    if (!f) return 0;
-    while (fgets(line, sizeof line, f) && (total == 0 || avail < 0)) {
-        sscanf(line, "MemTotal: %ld", &total);
-        sscanf(line, "MemAvailable: %ld", &avail);
-    }
-    fclose(f);
-    return (total > 0 && avail >= 0) ? 1.0 - (double)avail / total : 0;
-}
-
-static double clamp(double x, double lo, double hi)
-{
-    return x < lo ? lo : x > hi ? hi : x;
-}
-
-static double now_s(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec + ts.tv_nsec / 1e9;
-}
-
-/* ------------------------------------------------------------------ main */
-
-static volatile sig_atomic_t stop, reload;
-static void on_signal(int s) { if (s == SIGHUP) reload = 1; else stop = 1; }
 
 static void usage(void)
 {
-    puts("usage: fandynd [-c config] [-s statusfile] [-v]   run the daemon\n"
-         "       fandynd status [-s statusfile]             show current state\n"
-         "       fandynd --version");
+    puts("usage: fandynd                 run (normally started by systemd)\n"
+         "       fandynd --check         show profile, sensors and fan\n"
+         "       fandynd status          show live state\n"
+         "       fandynd --version\n"
+         "test options: --profile FILE  --root DIR  --run-dir DIR  --tick-ms N");
 }
+
+/* ------------------------------------------------------------------- main */
 
 int main(int argc, char **argv)
 {
-    const char *cfg_path = "/etc/fandyn/fandyn.conf";
-    const char *status_path = "/run/fandyn/status";
-    int show_status = 0;
+    const char *profile = DEFAULT_PROFILE, *root = "", *rundir = DEFAULT_RUNDIR;
+    int check = 0, status = 0;
 
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "status")) show_status = 1;
-        else if (!strcmp(argv[i], "-v")) verbose = 1;
-        else if (!strcmp(argv[i], "-c") && i + 1 < argc) cfg_path = argv[++i];
-        else if (!strcmp(argv[i], "-s") && i + 1 < argc) status_path = argv[++i];
-        else if (!strcmp(argv[i], "--version")) { puts("fandynd " VERSION); return 0; }
-        else { usage(); return !strcmp(argv[i], "-h") ? 0 : 2; }
+        const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
+        if (!strcmp(a, "--check")) check = 1;
+        else if (!strcmp(a, "status")) status = 1;
+        else if (!strcmp(a, "--version")) { puts("fandynd " FD_VERSION); return 0; }
+        else if (!strcmp(a, "--profile") && v) { profile = v; i++; }
+        else if (!strcmp(a, "--root") && v) { root = v; i++; }
+        else if (!strcmp(a, "--run-dir") && v) { rundir = v; i++; }
+        else if (!strcmp(a, "--tick-ms") && v && fd_parse_int(v, 1, 10000, &g_tick_ms) == 0) i++;
+        else { usage(); return !strcmp(a, "-h") || !strcmp(a, "--help") ? 0 : 2; }
     }
+    if (status) return cmd_status(rundir);
 
-    if (show_status) {
-        FILE *f = fopen(status_path, "r");
-        if (!f) { fprintf(stderr, "fandynd not running (no %s)\n", status_path); return 1; }
-        char buf[256];
-        while (fgets(buf, sizeof buf, f)) fputs(buf, stdout);
-        fclose(f);
-        return 0;
+    char fan[FD_PATH];
+    if (snprintf(fan, sizeof fan, "%s%s", root, FAN_DIR) >= (int)sizeof fan ||
+        mkpath(path.target, fan, "/target_pwm") || mkpath(path.control, fan, "/temp_control") ||
+        mkpath(path.tach_en, fan, "/tach_enable") || mkpath(path.rpm, fan, "/rpm_measured") ||
+        mkpath(path.status, rundir, "/status") || mkpath(path.status_tmp, rundir, "/status.tmp")) {
+        fputs("fandynd: path too long\n", stderr);
+        return 2;
     }
+    if (check) return cmd_check(root, profile);
 
-    struct cfg c;
-    load_cfg(cfg_path, &c);
-
-    char zones[MAX_ZONES][PATHLEN];
-    int nz = find_zones(c.zones, zones);
-    if (nz == 0) { logmsg("no thermal zones match '%s'", c.zones); return 1; }
-
-    if (write_long(FAN "temp_control", 0)) {
-        logmsg("cannot take fan control (%s): %s", FAN, strerror(errno));
-        return 1;
+    (void)mlockall(MCL_CURRENT | MCL_FUTURE);     /* never swap out the fan loop */
+    if (!isatty(STDERR_FILENO)) {                 /* a stuck journal must never block the loop */
+        int fl = fcntl(STDERR_FILENO, F_GETFL);
+        if (fl >= 0) (void)fcntl(STDERR_FILENO, F_SETFL, fl | O_NONBLOCK);
     }
-    write_long(FAN "tach_enable", 1);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_signal;
+    (void)sigemptyset(&sa.sa_mask);
+    (void)sigaction(SIGTERM, &sa, NULL);
+    (void)sigaction(SIGINT, &sa, NULL);
+    (void)sigaction(SIGHUP, &sa, NULL);
+    sa.sa_handler = SIG_IGN;
+    (void)sigaction(SIGPIPE, &sa, NULL);
 
-    struct sigaction sa = { .sa_handler = on_signal };
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGHUP, &sa, NULL);
+    struct fd_profile prof;
+    struct fd_timing tm;
+    struct fd_state st;
+    struct fd_zones zones;
+    memset(&st, 0, sizeof st);
+    use_profile(profile, &prof, 0);
+    fd_timing_init(&prof, g_tick_ms, &tm);
+    if (fd_find_zones(root, &zones) == 0) logev(EV_ZONES, 4, "no thermal zones found yet; will keep looking");
+    notify_init();
+    notify("READY=1");
+    logmsg(6, "fandynd %s running, %d sensor(s)", FD_VERSION, zones.n);
 
-    logmsg("fandynd %s: profile=%s, %d zones, interval %dms",
-           VERSION, c.profile, nz, c.interval_ms);
+    int written = -1, since_write = 0, bad_temp = 0, last_mode = -1, fan_ok = 1;
+    struct timespec next;
+    (void)clock_gettime(CLOCK_MONOTONIC, &next);
 
-    double tf = NAN, slope = 0, trimv = 0, cur = 0;
-    double last_t = now_s(), kick_until = 0, last_kick = -100, on_since = 0;
-    int written = -1, fan_on = !c.zero_rpm, stalls = 0, bad_reads = 0;
-    long rpm = 0;
-    read_cpu();
+    while (!g_stop) {
+        /* fixed-rate tick; resync instead of bursting if we fell behind */
+        next.tv_nsec += (long)(g_tick_ms % 1000) * 1000000L;
+        next.tv_sec += g_tick_ms / 1000 + next.tv_nsec / 1000000000L;
+        next.tv_nsec %= 1000000000L;
+        int sr = 0;
+        while (!g_stop && (sr = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL)) == EINTR)
+            if (g_reload) break;
+        if (g_stop) break;
+        if (sr != 0 && sr != EINTR) {           /* never spin: fall back to a plain sleep */
+            struct timespec d = { g_tick_ms / 1000, (long)(g_tick_ms % 1000) * 1000000L };
+            (void)nanosleep(&d, NULL);
+            (void)clock_gettime(CLOCK_MONOTONIC, &next);
+        }
+        struct timespec now;
+        (void)clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - next.tv_sec > 2) next = now;
+        g_tick++;
 
-    while (!stop) {
-        struct timespec ts = { c.interval_ms / 1000, (c.interval_ms % 1000) * 1000000L };
-        nanosleep(&ts, NULL);
-        if (stop) break;
-
-        if (reload) {
-            reload = 0;
-            load_cfg(cfg_path, &c);
-            nz = find_zones(c.zones, zones);
-            logmsg("config reloaded: profile=%s", c.profile);
+        if (g_reload) {
+            g_reload = 0;
+            use_profile(profile, &prof, 1);
+            fd_timing_init(&prof, g_tick_ms, &tm);
         }
 
-        double t = now_s(), dt = clamp(t - last_t, 0.05, 5);
-        last_t = t;
+        /* keep the kernel's own fan logic switched off (it may come back after
+           a driver reset, nvpmodel change or resume) */
+        if (g_tick % ASSERT_TICKS == 1 || !fan_ok) {
+            long ctl;
+            if (fd_read_long(path.control, &ctl) != 0) {
+                if (fan_ok) logev(EV_CONTROL, 4, "fan device not found at %s; retrying", fan);
+                fan_ok = 0;
+                written = -1;
+            } else {
+                if (!fan_ok) logmsg(6, "fan device found");
+                fan_ok = 1;
+                if (ctl != 0) {
+                    if (fd_write_long(path.control, 0) == 0) {
+                        if (g_tick > 1) logev(EV_CONTROL, 4, "kernel fan control was re-enabled; took it back");
+                        written = -1;
+                    } else {
+                        logev(EV_CONTROL, 3, "cannot disable kernel fan control: %s", strerror(errno));
+                    }
+                }
+                long te;
+                if (prof.tach && (fd_read_long(path.tach_en, &te) != 0 || te != 1))
+                    (void)fd_write_long(path.tach_en, 1);
+            }
+        }
 
-        /* 1. sensors */
-        double temp = read_temp(zones, nz);
-        double cpu = read_cpu();
-        long g = 0;
-        double gpu = read_long(GPU_LOAD, &g) == 0 ? clamp(g / 1000.0, 0, 1) : 0;
-        double ram = clamp((read_ram() - c.ram_base) / (1 - c.ram_base), 0, 1);
-        double load = fmax(fmax(cpu, gpu), c.ram_weight * ram);
+        int temp = fd_read_temp(&zones);
+        if (temp == FD_TEMP_INVALID) {
+            bad_temp = fd_inc(bad_temp);
+            if (bad_temp == FD_BAD_TICKS) logev(EV_TEMP, 3, "no readable temperature sensor; fan at full speed");
+            if (bad_temp % RESCAN_TICKS == 0) (void)fd_find_zones(root, &zones);
+        } else if (bad_temp) {
+            if (bad_temp >= FD_BAD_TICKS) logmsg(6, "temperature sensors back");
+            bad_temp = 0;
+        }
 
+        int rpm = -1;
         long r;
-        if (read_long(FAN "rpm_measured", &r) == 0 && r < 15000) rpm = r; /* drop tach glitches */
+        if (prof.tach && fd_read_long(path.rpm, &r) == 0 && r >= 0 && r <= FD_RPM_MAX) rpm = (int)r;
 
-        /* 2. filter temperature and its trend, then predict */
-        if (isnan(temp)) {
-            if (++bad_reads >= 3) temp = c.t_crit; /* sensors gone: fail safe */
-            else continue;
-        } else {
-            bad_reads = 0;
-        }
-        if (isnan(tf)) tf = temp;
-        double prev = tf;
-        tf += 0.4 * (temp - tf);
-        slope += 0.2 * ((tf - prev) / dt - slope);
-        double tp = tf + fmax(0, slope) * c.lookahead + c.load_gain * load;
+        int out = fd_step(&prof, &tm, &st, temp, rpm);
 
-        /* 3. curve + adaptive trim */
-        double x = clamp((tp - c.t_start) / (c.t_full - c.t_start), 0, 1);
-        double want = c.min_pwm + pow(x, c.curve) * (c.max_pwm - c.min_pwm);
-
-        double err = tf - c.t_limit;
-        trimv += c.ki * err * dt * (err > 0 ? 1 : 0.25); /* bleed off slowly */
-        trimv = clamp(trimv, 0, c.max_pwm - c.min_pwm);
-        want = clamp(want + trimv, c.min_pwm, c.max_pwm);
-
-        /* zero-RPM: stop when cool, restart on heat or load (hysteresis + 30s min run) */
-        if (c.zero_rpm) {
-            if (!fan_on && tp >= c.t_on) { fan_on = 1; on_since = t; }
-            else if (fan_on && tp < c.t_off && trimv == 0 && t - on_since > 30) fan_on = 0;
-        } else {
-            fan_on = 1;
-        }
-        if (!fan_on) want = 0;
-
-        /* 4. shape for noise: fast up, slow down */
-        int crit = temp >= c.t_crit;
-        if (crit) cur = c.max_pwm;
-        else if (want > cur) cur = fmin(want, cur + c.slew_up * dt);
-        else cur = fmax(want, cur - c.slew_down * dt);
-
-        int out = (int)lround(cur);
-        if (out > 0 && out < c.min_pwm) out = fan_on ? c.min_pwm : 0;
-
-        /* stall detection: fan should spin but tach says 0 */
-        stalls = (written >= c.min_pwm && rpm == 0 && t > kick_until + 3) ? stalls + 1 : 0;
-
-        if ((written <= 0 && out > 0) || (stalls >= 3 && t - last_kick > 10)) {
-            kick_until = t + c.kick_ms / 1000.0;
-            last_kick = t;
-            stalls = 0;
-            if (rpm == 0 && written > 0) logmsg("fan stall detected, kicking");
-        }
-        if (t < kick_until && out > 0) out = (int)fmax(out, c.kick_pwm);
-
-        int changed = written < 0 || abs(out - written) >= c.deadband || out == 0 ||
-                      out == c.max_pwm || t < kick_until || written == c.kick_pwm;
-        if (changed && out != written) {
-            if (write_long(FAN "target_pwm", out) == 0) written = out;
-            else logmsg("write target_pwm failed: %s", strerror(errno));
+        if (st.mode != last_mode) {
+            if (st.mode == FD_MODE_CRIT || st.mode == FD_MODE_FAULT || st.mode == FD_MODE_FAILSAFE)
+                logev(EV_MODE, 4, "mode %s (temp %d mC, rpm %d)", fd_mode_names[st.mode], temp, rpm);
+            else if (last_mode == FD_MODE_CRIT || last_mode == FD_MODE_FAULT || last_mode == FD_MODE_FAILSAFE)
+                logmsg(6, "back to normal (floor bias %d)", st.floor_bias);
+            last_mode = st.mode;
         }
 
-        /* status + debug */
-        char tmp[300];
-        snprintf(tmp, sizeof tmp, "%s.tmp", status_path);
-        FILE *f = fopen(tmp, "w");
-        if (f) {
-            fprintf(f, "profile=%s\ntemp=%.1f\npredicted=%.1f\ntrend=%.2f C/s\n"
-                       "cpu=%.0f%%\ngpu=%.0f%%\nram_pressure=%.0f%%\ntrim=%.1f\n"
-                       "pwm=%d\nrpm=%ld\nstate=%s\n",
-                    c.profile, tf, tp, slope, cpu * 100, gpu * 100, ram * 100,
-                    trimv, written, rpm,
-                    crit ? "critical" : t < kick_until ? "kick" : fan_on ? "on" : "off");
-            fclose(f);
-            rename(tmp, status_path);
+        since_write = fd_inc(since_write);
+        if (fan_ok && (out != written || since_write >= REFRESH_TICKS)) {
+            if (fd_write_long(path.target, out) == 0) {
+                written = out;
+                since_write = 0;
+            } else {
+                written = -1;
+                logev(EV_WRITE, 3, "cannot write %s: %s", path.target, strerror(errno));
+            }
         }
-        if (verbose)
-            logmsg("T=%.1f pred=%.1f d=%+.2f cpu=%3.0f gpu=%3.0f ram=%3.0f trim=%4.1f want=%5.1f pwm=%3d rpm=%ld",
-                   tf, tp, slope, cpu * 100, gpu * 100, ram * 100, trimv, want, written, rpm);
+
+        (void)write_status(&prof, &st, temp, rpm, out);
+        notify("WATCHDOG=1");
     }
 
-    write_long(FAN "temp_control", 1);
-    unlink(status_path);
-    logmsg("stopped, fan control returned to kernel");
+    notify("STOPPING=1");
+    int back = fd_write_long(path.control, 1);
+    (void)unlink(path.status);
+    logmsg(6, "stopped; fan control %s", back == 0 ? "returned to kernel" : "could not be returned to kernel");
     return 0;
 }

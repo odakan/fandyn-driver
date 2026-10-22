@@ -1,3 +1,25 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 set -e
-systemctl daemon-reload || true
+UNITS="fandyn.service fandyn-calibrate.timer"
+
+if [ -d /run/systemd/system ]; then
+    systemctl --system daemon-reload >/dev/null || true
+fi
+if [ "$1" = remove ] && command -v deb-systemd-helper >/dev/null 2>&1; then
+    deb-systemd-helper mask $UNITS >/dev/null || true
+fi
+if [ "$1" = purge ]; then
+    if command -v deb-systemd-helper >/dev/null 2>&1; then
+        deb-systemd-helper purge $UNITS >/dev/null || true
+        deb-systemd-helper unmask $UNITS >/dev/null || true
+    fi
+    rm -rf /var/lib/fandyn
+fi
+# whatever happened, the kernel controls the fan once we are gone
+if [ "$1" = remove ] || [ "$1" = purge ]; then
+    if [ -w /sys/devices/pwm-fan/temp_control ]; then
+        echo 1 > /sys/devices/pwm-fan/temp_control || true
+    fi
+fi
+exit 0
